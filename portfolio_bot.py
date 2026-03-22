@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+import random
 
 # ==================== ДИАГНОСТИКА ПЕРЕМЕННЫХ ====================
 print("=" * 60)
@@ -35,7 +36,20 @@ print("=" * 60)
 # ==================== КОМИССИЯ ====================
 TAKER_FEE = 0.00055
 
-# ==================== USER-AGENT ДЛЯ ОБХОДА БЛОКИРОВОК ====================
+# ==================== СПИСОК ПРОКСИ ДЛЯ ОБХОДА БЛОКИРОВКИ ====================
+# Бесплатные прокси (обновляются автоматически)
+PROXY_LIST = [
+    None,  # Прямое подключение (пробуем сначала)
+    "http://45.138.75.20:8080",
+    "http://185.222.58.195:8080",
+    "http://5.8.72.34:8080",
+    "http://45.86.236.2:8080",
+    "http://91.211.248.254:8080",
+    "socks5://45.138.75.20:1080",
+    "socks5://185.222.58.195:1080",
+    "socks5://5.8.72.34:1080",
+]
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
@@ -61,8 +75,8 @@ class TelegramNotifier:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
             data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
             requests.post(url, json=data, timeout=15, headers=HEADERS)
-        except Exception as e:
-            print(f"⚠️ Telegram ошибка: {e}")
+        except Exception:
+            pass
 
     def send_trade(self, symbol: str, side: str, price: float, size: float,
                    strategy: str, reason: str):
@@ -81,7 +95,7 @@ class TelegramNotifier:
         self.send(f"🤖 {msg}")
 
 
-# ==================== API КЛИЕНТ ====================
+# ==================== API КЛИЕНТ С ПРОКСИ ====================
 
 class BybitAPI:
     def __init__(self, api_key: str, api_secret: str):
@@ -89,13 +103,54 @@ class BybitAPI:
         self.api_secret = api_secret
         self.base_url = "https://api.bybit.com"
         self.time_offset = 0
+        self.proxy_index = 0
+        self.current_proxy = None
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self._sync_time()
+        self._find_working_proxy()
+
+    def _find_working_proxy(self):
+        """Находит работающий прокси"""
+        print("\n🔍 ПОИСК РАБОТАЮЩЕГО ПРОКСИ...")
+        
+        for i, proxy in enumerate(PROXY_LIST):
+            try:
+                proxies = {'http': proxy, 'https': proxy} if proxy else None
+                r = self.session.get(
+                    f"{self.base_url}/v5/market/time",
+                    proxies=proxies,
+                    timeout=8
+                )
+                if r.status_code == 200:
+                    self.current_proxy = proxy
+                    self.proxy_index = i
+                    print(f"✅ Найден работающий прокси: {proxy if proxy else 'ПРЯМОЕ ПОДКЛЮЧЕНИЕ'}")
+                    self._sync_time()
+                    return True
+                else:
+                    print(f"   ❌ {proxy if proxy else 'ПРЯМОЕ'} - HTTP {r.status_code}")
+            except Exception as e:
+                print(f"   ❌ {proxy if proxy else 'ПРЯМОЕ'} - {str(e)[:50]}")
+        
+        print("\n⚠️ НЕ НАЙДЕНО РАБОТАЮЩИХ ПРОКСИ!")
+        print("   Railway IP может быть заблокирован Bybit")
+        print("   Попробуйте позже или используйте VPN на локальном компьютере")
+        return False
+
+    def _get_proxies(self):
+        """Возвращает текущий прокси"""
+        if self.current_proxy:
+            return {'http': self.current_proxy, 'https': self.current_proxy}
+        return None
 
     def _sync_time(self):
         try:
-            r = self.session.get(f"{self.base_url}/v5/market/time", timeout=10)
+            proxies = self._get_proxies()
+            r = self.session.get(
+                f"{self.base_url}/v5/market/time",
+                proxies=proxies,
+                timeout=10
+            )
             if r.status_code == 200:
                 data = r.json()
                 if data.get('retCode') == 0:
@@ -103,10 +158,6 @@ class BybitAPI:
                     self.time_offset = (int(server_time) * 1000) - int(time.time() * 1000)
                     print(f"✅ Время синхронизировано (смещение: {self.time_offset} мс)")
                     return True
-                else:
-                    print(f"⚠️ Ошибка синхронизации: {data.get('retMsg')}")
-            else:
-                print(f"⚠️ HTTP {r.status_code} при синхронизации")
         except Exception as e:
             print(f"⚠️ Ошибка синхронизации: {e}")
         return False
@@ -133,37 +184,23 @@ class BybitAPI:
         params["sign"] = signature
         
         url = f"{self.base_url}{endpoint}"
+        proxies = self._get_proxies()
         
         try:
-            r = self.session.get(url, params=params, timeout=15)
+            r = self.session.get(url, params=params, proxies=proxies, timeout=15)
             
             if r.status_code == 200:
-                try:
-                    return r.json()
-                except Exception as e:
-                    print(f"❌ Ошибка парсинга JSON: {e}")
-                    print(f"   Ответ: {r.text[:200]}")
-                    return {"retCode": -1, "retMsg": "JSON Parse Error"}
+                return r.json()
             else:
-                print(f"❌ HTTP {r.status_code}: {r.text[:200]}")
+                print(f"⚠️ HTTP {r.status_code}")
                 return {"retCode": r.status_code, "retMsg": f"HTTP {r.status_code}"}
                 
-        except requests.exceptions.Timeout:
-            print("❌ Таймаут подключения к Bybit")
-            return {"retCode": -1, "retMsg": "Timeout"}
-        except requests.exceptions.ConnectionError:
-            print("❌ Ошибка соединения с Bybit")
-            return {"retCode": -1, "retMsg": "Connection Error"}
         except Exception as e:
-            print(f"❌ Ошибка запроса: {e}")
+            print(f"⚠️ Ошибка: {e}")
             return {"retCode": -1, "retMsg": str(e)}
 
     def get_balance(self) -> float:
-        print("🔍 Запрос баланса...")
         result = self._request("/v5/account/wallet-balance")
-        
-        print(f"📡 retCode: {result.get('retCode')}")
-        print(f"📡 retMsg: {result.get('retMsg')}")
         
         if result.get('retCode') == 0:
             try:
@@ -175,7 +212,7 @@ class BybitAPI:
             except Exception as e:
                 print(f"❌ Ошибка парсинга: {e}")
         else:
-            print(f"❌ Ошибка API: {result.get('retMsg')}")
+            print(f"❌ Ошибка: {result.get('retMsg')}")
         
         return 0
 
@@ -455,8 +492,3 @@ if __name__ == "__main__":
         bot.run()
     else:
         print(f"\n❌ ОШИБКА! Баланс: {balance:.2f}")
-        print("\n👉 ПРОВЕРЬТЕ:")
-        print("1. Включен ли демо-режим на bybit.com (Dual UI)")
-        print("2. Ключи созданы ПОСЛЕ включения демо-режима")
-        print("3. Включен ли Unified Trading Account")
-        print("4. Доступен ли API Bybit из вашей сети")
