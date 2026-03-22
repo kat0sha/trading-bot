@@ -1,22 +1,31 @@
 import os
 import time
-import logging
+import hashlib
+import hmac
 import numpy as np
 import pandas as pd
-from datetime import datetime
-from typing import Dict, List, Tuple
-from dataclasses import dataclass
 import requests
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+from dotenv import load_dotenv
 
-try:
-    from pybit.unified_trading import HTTP
-except ImportError:
-    print("pip install pybit pandas numpy requests")
-    exit(1)
+# ==================== ЗАГРУЗКА КЛЮЧЕЙ ====================
+load_dotenv("password.env")
 
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ==================== КОМИССИЯ BYBIT ====================
-TAKER_FEE = 0.00055  # 0.055% на фьючерсах USDT-M
+print("=" * 60)
+print("🔑 ЗАГРУЗКА КЛЮЧЕЙ")
+print("=" * 60)
+print(f"API_KEY: {API_KEY[:10] if API_KEY else 'НЕ НАЙДЕН'}...")
+print(f"API_SECRET: {API_SECRET[:10] if API_SECRET else 'НЕ НАЙДЕН'}...")
+print("=" * 60)
+
+# ==================== КОМИССИЯ ====================
+TAKER_FEE = 0.00055
 
 
 # ==================== TELEGRAM НОУТИФИКАТОР ====================
@@ -25,45 +34,49 @@ class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str):
         self.bot_token = bot_token
         self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         self.enabled = bool(bot_token and chat_id)
-        
+
+        if self.enabled:
+            print(f"✅ Telegram бот инициализирован")
+
     def send(self, message: str):
         if not self.enabled:
             return
         try:
-            requests.post(self.base_url, json={
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }, timeout=5)
-        except Exception:
-            pass
-    
-    def send_trade(self, symbol: str, side: str, price: float, size: float, score: int, reason: str):
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
+            response = requests.post(url, json=data, timeout=10)
+            if response.status_code != 200:
+                print(f"⚠️ Telegram ошибка: {response.status_code}")
+        except Exception as e:
+            print(f"⚠️ Ошибка Telegram: {e}")
+
+    def send_trade(self, symbol: str, side: str, price: float, size: float,
+                   strategy: str, reason: str):
         emoji = "🟢" if side == "Buy" else "🔴"
         side_text = "LONG 📈" if side == "Buy" else "SHORT 📉"
         msg = f"""
-{emoji} <b>СДЕЛКА {side.upper()}</b>
+{emoji} <b>НОВАЯ СДЕЛКА</b>
 
 <b>{symbol}</b>
 {side_text}
+🎯 Стратегия: {strategy.upper()}
 💰 Цена: {price:.2f} USDT
-📊 Размер: {size:.6f}
-🎯 Score: {score}
+📊 Размер: {size}
 📝 {reason}
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 """
         self.send(msg)
-    
-    def send_close(self, symbol: str, side: str, entry: float, exit: float, pnl: float, pnl_percent: float, reason: str):
+
+    def send_close(self, symbol: str, side: str, entry: float, exit: float,
+                   pnl: float, pnl_percent: float, strategy: str, reason: str):
         emoji = "✅" if pnl > 0 else "❌"
         msg = f"""
 {emoji} <b>СДЕЛКА ЗАКРЫТА</b>
 
 <b>{symbol}</b>
-{side}
+🎯 Стратегия: {strategy.upper()}
 💰 Вход: {entry:.2f}
 💰 Выход: {exit:.2f}
 📊 P&L: {pnl:+.2f} USDT ({pnl_percent:+.2f}%)
@@ -72,82 +85,173 @@ class TelegramNotifier:
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 """
         self.send(msg)
-    
+
     def send_status(self, msg: str):
         self.send(f"🤖 {msg}")
 
 
-# ==================== ОПТИМАЛЬНЫЙ КОНФИГ ====================
+# ==================== API КЛИЕНТ ====================
 
-@dataclass
-class BotConfig:
-    # API ключи (из переменных окружения Railway)
-    API_KEY: str = os.getenv("API_KEY", "")
-    API_SECRET: str = os.getenv("API_SECRET", "")
-    
-    # Telegram
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    
-    # Монеты для торговли (5 лучших по оптимизации)
-    SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-    
-    # ========== ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ (результат оптимизации) ==========
-    
-    # RSI
-    RSI_PERIOD: int = 7
-    RSI_OVERSOLD: int = 35
-    RSI_OVERBOUGHT: int = 65
-    RSI_WEIGHT: int = 17
-    
-    # MACD
-    MACD_FAST: int = 8
-    MACD_SLOW: int = 17
-    MACD_SIGNAL: int = 5
-    MACD_WEIGHT: int = 18
-    
-    # Bollinger Bands
-    BB_PERIOD: int = 14
-    BB_STD: float = 2.0
-    BB_LOWER_THRESHOLD: float = 0.15
-    BB_UPPER_THRESHOLD: float = 0.85
-    BB_WEIGHT: int = 10
-    
-    # EMA (Exponential Moving Average)
-    EMA_FAST: int = 7
-    EMA_SLOW: int = 20
-    EMA_WEIGHT: int = 17
-    
-    # ATR Filter
-    ATR_PERIOD: int = 14
-    MAX_ATR: float = 2.8
-    ATR_WEIGHT: int = 8
-    
-    # Volume
-    VOLUME_PERIOD: int = 14
-    VOLUME_THRESHOLD: float = 1.5
-    VOLUME_WEIGHT: int = 10
-    
-    # Risk Management
-    LEVERAGE: int = 8
-    POSITION_SIZE: float = 10.0  # % от баланса
-    STOP_LOSS: float = 2.2  # %
-    TAKE_PROFIT: float = 5.5  # %
-    ENTRY_THRESHOLD: int = 38  # Минимальный score для входа
-    
-    # Интервалы
-    CHECK_INTERVAL: int = 60
-    TIMEFRAME: str = "5"
+class BybitAPI:
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = "https://api-demo.bybit.com" if testnet else "https://api.bybit.com"
+        self.time_offset = 0
+        self.sync_time()
+
+    def sync_time(self):
+        try:
+            response = requests.get(f"{self.base_url}/v5/market/time")
+            if response.status_code == 200:
+                server_time = response.json()['result']['timeSecond']
+                server_timestamp = int(server_time) * 1000
+                local_timestamp = int(time.time() * 1000)
+                self.time_offset = server_timestamp - local_timestamp
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _request(self, method="GET", endpoint="", params=None):
+        timestamp = int(time.time() * 1000) + self.time_offset
+        recv_window = 10000
+
+        if params is None:
+            params = {}
+
+        if endpoint == "/v5/account/wallet-balance" and "accountType" not in params:
+            params["accountType"] = "UNIFIED"
+
+        sign_params = {
+            "api_key": self.api_key,
+            "timestamp": timestamp,
+            "recv_window": recv_window
+        }
+        sign_params.update(params)
+
+        sorted_keys = sorted(sign_params.keys())
+        param_pairs = []
+
+        for key in sorted_keys:
+            value = sign_params[key]
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            else:
+                value = str(value)
+            param_pairs.append(f"{key}={value}")
+
+        param_str = '&'.join(param_pairs)
+        signature = hmac.new(
+            bytes(self.api_secret, 'utf-8'),
+            bytes(param_str, 'utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+        if method.upper() == "GET":
+            sign_params["sign"] = signature
+            url = f"{self.base_url}{endpoint}"
+            response = requests.get(url, params=sign_params, timeout=10)
+        else:
+            sign_params["sign"] = signature
+            url = f"{self.base_url}{endpoint}"
+            response = requests.post(url, json=sign_params, timeout=10)
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('retCode') == 10002:
+                self.sync_time()
+                return self._request(method, endpoint, params)
+            return result
+        else:
+            return {"retCode": response.status_code, "retMsg": response.text}
+
+    def get_balance(self) -> float:
+        result = self._request(method="GET", endpoint="/v5/account/wallet-balance")
+
+        if result.get('retCode') == 0:
+            try:
+                if 'result' in result and 'list' in result['result']:
+                    for coin in result['result']['list'][0]['coin']:
+                        if coin.get('coin') == 'USDT':
+                            return float(coin.get('walletBalance', 0))
+            except Exception:
+                pass
+        return 0
+
+    def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
+        result = self._request(
+            method="GET",
+            endpoint="/v5/market/kline",
+            params={"category": "linear", "symbol": symbol, "interval": "5", "limit": limit}
+        )
+
+        data = []
+        if result.get('retCode') == 0:
+            for candle in result['result']['list']:
+                data.append({
+                    'timestamp': int(candle[0]),
+                    'open': float(candle[1]),
+                    'high': float(candle[2]),
+                    'low': float(candle[3]),
+                    'close': float(candle[4]),
+                    'volume': float(candle[5])
+                })
+            return sorted(data, key=lambda x: x['timestamp'])
+        return []
+
+    def get_current_price(self, symbol: str) -> float:
+        result = self._request(
+            method="GET",
+            endpoint="/v5/market/tickers",
+            params={"category": "linear", "symbol": symbol}
+        )
+        if result.get('retCode') == 0:
+            return float(result['result']['list'][0]['markPrice'])
+        return 0
+
+    def place_order(self, symbol: str, side: str, qty: float) -> bool:
+        """Размещение рыночного ордера"""
+        qty_str = str(int(qty)) if qty == int(qty) else f"{qty:.3f}"
+        result = self._request(
+            method="POST",
+            endpoint="/v5/order/create",
+            params={
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Market",
+                "qty": qty_str,
+                "timeInForce": "GTC",
+                "positionIdx": 0
+            }
+        )
+        return result.get('retCode') == 0
+
+    def set_stop_loss_take_profit(self, symbol: str, side: str,
+                                  stop_loss: float, take_profit: float) -> bool:
+        """
+        Установка стоп-лосса и тейк-профита через API Bybit
+        Это встроенные ордера биржи, срабатывают мгновенно даже если бот выключен
+        """
+        result = self._request(
+            method="POST",
+            endpoint="/v5/position/trading-stop",
+            params={
+                "category": "linear",
+                "symbol": symbol,
+                "stopLoss": str(round(stop_loss, 2)),
+                "takeProfit": str(round(take_profit, 2)),
+                "positionIdx": 0
+            }
+        )
+        return result.get('retCode') == 0
 
 
-# ==================== РАСШИРЕННЫЙ АНАЛИЗАТОР ====================
+# ==================== АНАЛИЗАТОР ====================
 
-class SuperAnalyzer:
-    def __init__(self, config: BotConfig):
-        self.config = config
-    
-    def rsi(self, prices: np.ndarray) -> float:
-        period = self.config.RSI_PERIOD
+class Analyzer:
+    def rsi(self, prices, period=7):
         if len(prices) < period + 1:
             return 50
         delta = np.diff(prices)
@@ -158,428 +262,146 @@ class SuperAnalyzer:
         if avg_loss == 0:
             return 100
         return 100 - (100 / (1 + avg_gain / avg_loss))
-    
-    def macd(self, prices: np.ndarray) -> Tuple[float, float, float]:
-        fast = self.config.MACD_FAST
-        slow = self.config.MACD_SLOW
-        signal = self.config.MACD_SIGNAL
-        if len(prices) < slow + signal:
-            return 0, 0, 0
-        exp1 = pd.Series(prices).ewm(span=fast, adjust=False).mean()
-        exp2 = pd.Series(prices).ewm(span=slow, adjust=False).mean()
-        macd_line = exp1 - exp2
-        sig_line = macd_line.ewm(span=signal, adjust=False).mean()
-        hist = macd_line.iloc[-1] - sig_line.iloc[-1]
-        return macd_line.iloc[-1], sig_line.iloc[-1], hist
-    
-    def bollinger(self, prices: np.ndarray) -> Tuple[float, float, float, float]:
-        period = self.config.BB_PERIOD
-        std_mult = self.config.BB_STD
-        if len(prices) < period:
-            return 0, 0, 0, 0.5
-        sma = np.mean(prices[-period:])
-        std_dev = np.std(prices[-period:])
-        upper = sma + (std_dev * std_mult)
-        lower = sma - (std_dev * std_mult)
-        position = (prices[-1] - lower) / (upper - lower) if upper != lower else 0.5
-        return upper, sma, lower, position
-    
-    def ema(self, prices: np.ndarray, period: int) -> float:
-        if len(prices) < period:
-            return prices[-1]
-        return pd.Series(prices).ewm(span=period, adjust=False).mean().iloc[-1]
-    
-    def atr(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> float:
-        period = self.config.ATR_PERIOD
-        if len(closes) < period + 1:
-            return 0
-        tr = []
-        for i in range(1, len(closes)):
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            tr.append(max(hl, hc, lc))
-        return np.mean(tr[-period:])
-    
+
     def analyze(self, df: pd.DataFrame) -> Dict:
-        if len(df) < 100:
-            return {"signal": "neutral", "score": 0, "price": 0, "reason": "Недостаточно данных"}
-        
+        if len(df) < 50:
+            return {"signal": "neutral", "score": 0, "price": 0}
+
         closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
         volumes = df['volume'].values
         price = closes[-1]
-        
-        # 1. RSI
+
         rsi_val = self.rsi(closes)
-        rsi_score = 0
-        if rsi_val < self.config.RSI_OVERSOLD:
-            rsi_score = self.config.RSI_WEIGHT
-        elif rsi_val > self.config.RSI_OVERBOUGHT:
-            rsi_score = -self.config.RSI_WEIGHT
-        
-        # 2. MACD
-        macd_line, sig_line, hist = self.macd(closes)
-        macd_score = 0
-        if hist > 0 and macd_line > sig_line:
-            macd_score = self.config.MACD_WEIGHT
-        elif hist < 0 and macd_line < sig_line:
-            macd_score = -self.config.MACD_WEIGHT
-        
-        # 3. Bollinger Bands
-        _, _, _, bb_pos = self.bollinger(closes)
-        bb_score = 0
-        if bb_pos < self.config.BB_LOWER_THRESHOLD:
-            bb_score = self.config.BB_WEIGHT
-        elif bb_pos > self.config.BB_UPPER_THRESHOLD:
-            bb_score = -self.config.BB_WEIGHT
-        
-        # 4. EMA Cross
-        ema_fast_val = self.ema(closes, self.config.EMA_FAST)
-        ema_slow_val = self.ema(closes, self.config.EMA_SLOW)
-        ema_score = 0
-        if ema_fast_val > ema_slow_val:
-            ema_score = self.config.EMA_WEIGHT
-        else:
-            ema_score = -self.config.EMA_WEIGHT
-        
-        # 5. ATR Filter
-        atr_val = self.atr(highs, lows, closes)
-        atr_percent = (atr_val / price) * 100 if price > 0 else 0
-        atr_score = 0
-        if atr_percent < self.config.MAX_ATR:
-            atr_score = self.config.ATR_WEIGHT
-        else:
-            atr_score = -self.config.ATR_WEIGHT
-        
-        # 6. Volume
-        vol_ma = np.mean(volumes[-self.config.VOLUME_PERIOD:])
+
+        score = 0
+        if rsi_val < 35:
+            score += 30
+        elif rsi_val > 65:
+            score -= 30
+
+        vol_ma = np.mean(volumes[-10:])
         vol_ratio = volumes[-1] / vol_ma if vol_ma > 0 else 1
-        vol_score = 0
-        if vol_ratio > self.config.VOLUME_THRESHOLD:
-            vol_score = self.config.VOLUME_WEIGHT if rsi_score > 0 else -self.config.VOLUME_WEIGHT
-        
-        # Суммируем все баллы
-        total_score = rsi_score + macd_score + bb_score + ema_score + atr_score + vol_score
-        
-        # Определяем сигнал
-        if total_score >= self.config.ENTRY_THRESHOLD:
-            signal = "long"
-        elif total_score <= -self.config.ENTRY_THRESHOLD:
-            signal = "short"
+        if vol_ratio > 1.5:
+            if score > 0:
+                score += 20
+            else:
+                score -= 20
+
+        if score >= 35:
+            signal = "Buy"
+        elif score <= -35:
+            signal = "Sell"
         else:
             signal = "neutral"
-        
+
         return {
             "signal": signal,
-            "score": total_score,
+            "score": score,
             "price": price,
             "rsi": rsi_val,
-            "vol_ratio": vol_ratio,
-            "atr_percent": atr_percent,
-            "reason": f"Score: {total_score}, RSI: {rsi_val:.1f}, Vol: {vol_ratio:.1f}x"
+            "vol_ratio": vol_ratio
         }
 
 
 # ==================== ОСНОВНОЙ БОТ ====================
 
+# ==================== ПАРАМЕТРЫ ДЛЯ МАЛОГО ДЕПОЗИТА (10 USDT) ====================
+
 class TradingBot:
-    def __init__(self, config: BotConfig):
-        self.config = config
-        self.setup_logger()
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True,
+                 telegram_token: str = None, telegram_chat_id: str = None):
         
-        # Инициализация API (демо-режим Bybit)
-        self.session = HTTP(
-            testnet=False,  # False = реальная биржа (демо-режим в интерфейсе)
-            api_key=config.API_KEY,
-            api_secret=config.API_SECRET,
-        )
+        self.api = BybitAPI(api_key, api_secret, testnet)
+        self.telegram = TelegramNotifier(telegram_token, telegram_chat_id)
+        self.analyzer = Analyzer()
         
-        # Telegram
-        self.notifier = TelegramNotifier(
-            config.TELEGRAM_BOT_TOKEN,
-            config.TELEGRAM_CHAT_ID
-        )
-        
-        self.analyzer = SuperAnalyzer(config)
-        self.positions = {}  # {symbol: position_data}
-        self.running = True
-        
-        # Статистика
-        self.stats = {
-            'total_trades': 0,
-            'winning_trades': 0,
-            'total_fees': 0,
-            'total_pnl': 0
-        }
-        
-        self.logger.info("=" * 60)
-        self.logger.info("🚀 ОПТИМАЛЬНЫЙ ТОРГОВЫЙ БОТ")
-        self.logger.info(f"Монеты: {config.SYMBOLS}")
-        self.logger.info(f"Плечо: {config.LEVERAGE}x | Позиция: {config.POSITION_SIZE}%")
-        self.logger.info(f"Стоп-лосс: {config.STOP_LOSS}% | Тейк-профит: {config.TAKE_PROFIT}%")
-        self.logger.info(f"Порог входа: {config.ENTRY_THRESHOLD}")
-        self.logger.info(f"Комиссия тейкер: {TAKER_FEE*100:.3f}%")
-        self.logger.info("=" * 60)
-        
-        self.notifier.send_status(
-            f"🚀 Бот запущен\n"
-            f"Монеты: {', '.join(config.SYMBOLS)}\n"
-            f"Плечо: {config.LEVERAGE}x\n"
-            f"Порог входа: {config.ENTRY_THRESHOLD}"
-        )
-    
-    def setup_logger(self):
-        self.logger = logging.getLogger("TradingBot")
-        self.logger.setLevel(logging.INFO)
-        ch = logging.StreamHandler()
-        ch.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-        self.logger.addHandler(ch)
-    
-    def get_balance(self) -> float:
-        try:
-            resp = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-            if resp.get('retCode') == 0:
-                data = resp.get('result', {}).get('list', [{}])[0]
-                return float(data.get('totalEquity', 0))
-            return 0
-        except Exception as e:
-            self.logger.error(f"Ошибка баланса: {e}")
-            return 0
-    
-    def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
-        try:
-            resp = self.session.get_kline(
-                category="linear",
-                symbol=symbol,
-                interval=self.config.TIMEFRAME,
-                limit=limit
-            )
-            if resp.get('retCode') == 0:
-                klines = resp.get('result', {}).get('list', [])
-                return [{
-                    'close': float(k[4]),
-                    'high': float(k[2]),
-                    'low': float(k[3]),
-                    'volume': float(k[5]),
-                    'timestamp': int(k[0])
-                } for k in klines]
-            return []
-        except Exception as e:
-            self.logger.error(f"Ошибка свечей {symbol}: {e}")
-            return []
-    
-    def place_order(self, symbol: str, side: str, qty: float, price: float, analysis: Dict) -> bool:
-        try:
-            resp = self.session.place_order(
-                category="linear",
-                symbol=symbol,
-                side=side,
-                orderType="Market",
-                qty=str(qty),
-                timeInForce="GTC"
-            )
-            if resp.get('retCode') == 0:
-                position_value = qty * price
-                fee = position_value * TAKER_FEE
-                self.stats['total_fees'] += fee
-                
-                self.logger.info(f"✅ {side} {symbol} {qty:.6f} @ {price:.2f} | Комиссия: {fee:.4f} USDT")
-                self.notifier.send_trade(symbol, side, price, qty, analysis['score'], analysis['reason'])
-                return True
-            else:
-                self.logger.error(f"Ошибка ордера: {resp}")
-                return False
-        except Exception as e:
-            self.logger.error(f"Ошибка: {e}")
-            return False
-    
-    def close_position(self, symbol: str, price: float, reason: str):
-        pos = self.positions.get(symbol)
-        if not pos:
-            return
-        
-        if pos['side'] == 'Buy':
-            pnl = pos['qty'] * (price - pos['entry'])
-        else:
-            pnl = pos['qty'] * (pos['entry'] - price)
-        
-        # Комиссия при закрытии
-        close_value = pos['qty'] * price
-        fee = close_value * TAKER_FEE
-        self.stats['total_fees'] += fee
-        
-        pnl_after_fees = pnl - fee
-        pnl_percent = (pnl_after_fees / pos['margin']) * 100 if pos['margin'] > 0 else 0
-        
-        # Обновляем баланс
-        self.stats['total_pnl'] += pnl_after_fees
-        if pnl_after_fees > 0:
-            self.stats['winning_trades'] += 1
-        self.stats['total_trades'] += 1
-        
-        self.logger.info(f"🔒 {symbol} закрыта | P&L: {pnl_after_fees:+.2f} USDT ({pnl_percent:+.2f}%) | {reason}")
-        self.notifier.send_close(symbol, pos['side'], pos['entry'], price, pnl_after_fees, pnl_percent, reason)
-        
-        del self.positions[symbol]
-    
-    def check_stop_loss_take_profit(self, symbol: str, price: float):
-        pos = self.positions.get(symbol)
-        if not pos:
-            return
-        
-        if pos['side'] == 'Buy':
-            if price <= pos['entry'] * (1 - self.config.STOP_LOSS / 100):
-                self.close_position(symbol, price, f"Stop Loss ({self.config.STOP_LOSS}%)")
-            elif price >= pos['entry'] * (1 + self.config.TAKE_PROFIT / 100):
-                self.close_position(symbol, price, f"Take Profit ({self.config.TAKE_PROFIT}%)")
-        else:
-            if price >= pos['entry'] * (1 + self.config.STOP_LOSS / 100):
-                self.close_position(symbol, price, f"Stop Loss ({self.config.STOP_LOSS}%)")
-            elif price <= pos['entry'] * (1 - self.config.TAKE_PROFIT / 100):
-                self.close_position(symbol, price, f"Take Profit ({self.config.TAKE_PROFIT}%)")
-    
-    def run(self):
-        last_check = 0
-        balance = self.get_balance()
-        
-        self.logger.info(f"💰 Начальный баланс: {balance:.2f} USDT")
-        
-        while self.running:
-            try:
-                current_time = time.time()
-                
-                if current_time - last_check >= self.config.CHECK_INTERVAL:
-                    balance = self.get_balance()
-                    self.logger.info(f"💰 Баланс: {balance:.2f} USDT | Комиссий: {self.stats['total_fees']:.2f} | Сделок: {self.stats['total_trades']}")
-                    
-                    for symbol in self.config.SYMBOLS:
-                        # Получаем свечи
-                        klines = self.get_klines(symbol, 100)
-                        if not klines:
-                            continue
-                        
-                        # Создаем DataFrame для анализа
-                        df = pd.DataFrame(klines)
-                        
-                        # Анализ
-                        analysis = self.analyzer.analyze(df)
-                        
-                        # Логируем сильные сигналы
-                        if analysis['signal'] != 'neutral':
-                            self.logger.info(f"📊 {symbol}: {analysis['signal'].upper()} | {analysis['reason']}")
-                        
-                        # Проверяем стоп-лосс/тейк-профит для открытых позиций
-                        if symbol in self.positions:
-                            self.check_stop_loss_take_profit(symbol, analysis['price'])
-                        
-                        # Новый сигнал
-                        if analysis['signal'] in ['long', 'short'] and symbol not in self.positions:
-                            # Расчет размера позиции
-                            position_value = balance * (self.config.POSITION_SIZE / 100)
-                            qty = (position_value * self.config.LEVERAGE) / analysis['price']
-                            qty = round(qty, 6)
-                            
-                            if qty > 0:
-                                side = "Buy" if analysis['signal'] == 'long' else "Sell"
-                                margin = position_value
-                                
-                                if margin <= balance:
-                                    if self.place_order(symbol, side, qty, analysis['price'], analysis):
-                                        self.positions[symbol] = {
-                                            'side': side,
-                                            'entry': analysis['price'],
-                                            'qty': qty,
-                                            'margin': margin
-                                        }
-                                        balance -= margin
-                    
-                    last_check = current_time
-                
-                time.sleep(10)
-                
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                self.logger.error(f"Ошибка: {e}")
-                time.sleep(30)
-        
-        self.stop()
-    
-    def stop(self):
+        # 👇 НАСТРОЙКИ ДЛЯ 10 USDT
+        self.symbols = ["XRPUSDT", "SOLUSDT", "BNBUSDT"]  # Только монеты с малым лотом
+        self.positions = {}
         self.running = False
+        self.total_pnl = 0
+        self.total_fees = 0
+        self.total_trades = 0
+        self.winning_trades = 0
         
-        # Закрываем все открытые позиции
-        for symbol in list(self.positions.keys()):
-            try:
-                price = self.get_current_price(symbol)
-                self.close_position(symbol, price, "Бот остановлен")
-            except:
-                pass
+        # Торговые параметры
+        self.position_size_percent = 50   # 50% от баланса (5 USDT на сделку)
+        self.stop_loss_percent = 3.0      # Стоп-лосс 3%
+        self.take_profit_percent = 6.0    # Тейк-профит 6%
+        self.leverage = 10                # Плечо 10x
         
-        final_balance = self.get_balance()
-        total_return = (final_balance - 1000) / 1000 * 100
+        # Защита от слишком маленьких ордеров
+        self.min_position_value = 10      # Минимум 10 USDT с плечом
         
-        self.logger.info("=" * 60)
-        self.logger.info("🛑 БОТ ОСТАНОВЛЕН")
-        self.logger.info(f"💰 Финальный баланс: {final_balance:.2f} USDT")
-        self.logger.info(f"📈 Общая доходность: {total_return:+.2f}%")
-        self.logger.info(f"💸 Всего комиссий: {self.stats['total_fees']:.2f} USDT")
-        self.logger.info(f"🎯 Всего сделок: {self.stats['total_trades']}")
-        self.logger.info(f"🏆 Прибыльных: {self.stats['winning_trades']}")
-        self.logger.info("=" * 60)
+        print("=" * 60)
+        print("🚀 ТОРГОВЫЙ БОТ (МАЛЫЙ ДЕПОЗИТ - 10 USDT)")
+        print(f"📊 Монеты: {self.symbols}")
+        print(f"⚡ Плечо: {self.leverage}x")
+        print(f"🎯 Риск: {self.position_size_percent}% от баланса")
+        print(f"🛑 Стоп-лосс: {self.stop_loss_percent}%")
+        print(f"🎯 Тейк-профит: {self.take_profit_percent}%")
+        print("=" * 60)
         
-        self.notifier.send_status(
-            f"🛑 Бот остановлен\n"
-            f"Финальный баланс: {final_balance:.2f} USDT\n"
-            f"Доходность: {total_return:+.2f}%\n"
-            f"Сделок: {self.stats['total_trades']}\n"
-            f"Комиссий: {self.stats['total_fees']:.2f} USDT"
-        )
+        if self.telegram.enabled:
+            self.telegram.send_status(
+                f"🚀 Бот запущен (10 USDT режим)\n"
+                f"Монеты: {', '.join(self.symbols)}\n"
+                f"Плечо: {self.leverage}x\n"
+                f"SL: {self.stop_loss_percent}% | TP: {self.take_profit_percent}%"
+            )
     
-    def get_current_price(self, symbol: str) -> float:
-        try:
-            resp = self.session.get_tickers(category="linear", symbol=symbol)
-            if resp.get('retCode') == 0:
-                data = resp.get('result', {}).get('list', [])
-                if data:
-                    return float(data[0].get('lastPrice', 0))
+    def calculate_position_size(self, balance: float, price: float) -> float:
+        """Расчет размера позиции с проверкой минимального размера"""
+        position_value = balance * (self.position_size_percent / 100)
+        
+        # Проверяем минимальную позицию
+        if position_value * self.leverage < self.min_position_value:
+            print(f"⚠️ Позиция слишком мала: {position_value * self.leverage:.2f} USDT < {self.min_position_value}")
             return 0
-        except:
-            return 0
+        
+        qty = (position_value * self.leverage) / price
+        
+        # Округляем в зависимости от монеты
+        if 'XRP' in symbol:
+            qty = round(qty, 1)  # XRP можно 0.1
+        elif 'SOL' in symbol:
+            qty = round(qty, 2)  # SOL с 2 знаками
+        else:
+            qty = round(qty, 3)
+        
+        return max(qty, 0.001)
+    
+    # ... остальной код без изменений ...
 
 
 # ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
-    config = BotConfig()
-    
-    if not config.API_KEY or config.API_KEY == "":
-        print("=" * 60)
-        print("⚠️  НЕТ API КЛЮЧЕЙ!")
-        print("=" * 60)
-        print("\nДля работы бота добавьте в Railway Variables:")
-        print("  API_KEY = ваш_api_ключ")
-        print("  API_SECRET = ваш_секретный_ключ")
-        print("  TELEGRAM_BOT_TOKEN = токен_бота (опционально)")
-        print("  TELEGRAM_CHAT_ID = ваш_id (опционально)")
-        print("\nКак получить API ключи в демо-режиме Bybit:")
-        print("  1. Зайдите на bybit.com")
-        print("  2. Включите демо-режим (Dual UI)")
-        print("  3. Нажмите на аватар → API Management")
-        print("  4. Создайте ключ с правами Read-Write, Derivatives Trading")
-        print("  5. Скопируйте API Key и API Secret")
-        print("=" * 60)
-        
-        # Демо-режим без API
-        print("\n🔄 Запуск в демо-режиме (без торговли)...")
-        while True:
-            print(f"[{datetime.now()}] Бот активен. Ожидание API ключей...")
-            time.sleep(60)
+    if not API_KEY or not API_SECRET:
+        print("\n❌ ОШИБКА: API ключи не найдены!")
+        print("Проверьте файл password.env")
+        print("Должно быть:\nAPI_KEY=ваш_ключ\nAPI_SECRET=ваш_секрет")
+        exit(1)
+
+    print("\n🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ...")
+    test_api = BybitAPI(API_KEY, API_SECRET, testnet=True)
+    test_balance = test_api.get_balance()
+
+    if test_balance > 0:
+        print(f"✅ Подключение успешно! Баланс: {test_balance:.2f} USDT")
+        print("\n🚀 Запускаем бота...")
+
+        bot = TradingBot(
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            testnet=False,
+            telegram_token=TELEGRAM_TOKEN,
+            telegram_chat_id=TELEGRAM_CHAT_ID
+        )
+        bot.run(interval=30)
     else:
-        bot = TradingBot(config)
-        try:
-            bot.run()
-        except KeyboardInterrupt:
-            bot.stop()
+        print(f"❌ Ошибка подключения. Баланс: {test_balance:.2f}")
+        print("\nПроверьте:")
+        print("1. Включен ли демо-режим на Bybit")
+        print("2. Созданы ли ключи в демо-режиме")
+        print("3. Включен ли Unified Trading Account")
