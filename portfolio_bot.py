@@ -8,6 +8,31 @@ import requests
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
+# ==================== ДИАГНОСТИКА ПЕРЕМЕННЫХ ====================
+print("=" * 60)
+print("🔍 ДИАГНОСТИКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ")
+print("=" * 60)
+
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+print(f"API_KEY: {'✅ НАЙДЕН' if API_KEY else '❌ НЕ НАЙДЕН'} ({API_KEY[:10] if API_KEY else 'None'}...)")
+print(f"API_SECRET: {'✅ НАЙДЕН' if API_SECRET else '❌ НЕ НАЙДЕН'} ({API_SECRET[:10] if API_SECRET else 'None'}...)")
+print(f"TELEGRAM_TOKEN: {'✅ НАЙДЕН' if TELEGRAM_TOKEN else '❌ НЕ НАЙДЕН'}")
+print(f"TELEGRAM_CHAT_ID: {'✅ НАЙДЕН' if TELEGRAM_CHAT_ID else '❌ НЕ НАЙДЕН'}")
+
+if not API_KEY or not API_SECRET:
+    print("\n❌ ПЕРЕМЕННЫЕ НЕ НАЙДЕНЫ!")
+    print("\n👉 ДОБАВЬТЕ В RAILWAY VARIABLES:")
+    print("   API_KEY = ваш_ключ")
+    print("   API_SECRET = ваш_секрет")
+    print("\nИ нажмите Redeploy")
+    exit(1)
+
+print("=" * 60)
+
 # ==================== КОМИССИЯ ====================
 TAKER_FEE = 0.00055
 
@@ -19,7 +44,6 @@ class TelegramNotifier:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.enabled = bool(bot_token and chat_id)
-
         if self.enabled:
             print(f"✅ Telegram бот инициализирован")
 
@@ -53,97 +77,62 @@ class TelegramNotifier:
 # ==================== API КЛИЕНТ ====================
 
 class BybitAPI:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+    def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = "https://api.bybit.com" if not testnet else "https://api-demo.bybit.com"
+        self.base_url = "https://api.bybit.com"
         self.time_offset = 0
-        self.sync_time()
+        self._sync_time()
 
-    def sync_time(self):
+    def _sync_time(self):
         try:
-            response = requests.get(f"{self.base_url}/v5/market/time", timeout=5)
-            if response.status_code == 200:
-                server_time = response.json()['result']['timeSecond']
-                server_timestamp = int(server_time) * 1000
-                local_timestamp = int(time.time() * 1000)
-                self.time_offset = server_timestamp - local_timestamp
+            r = requests.get(f"{self.base_url}/v5/market/time", timeout=5)
+            if r.status_code == 200:
+                server_time = r.json()['result']['timeSecond']
+                self.time_offset = (int(server_time) * 1000) - int(time.time() * 1000)
+                print("✅ Время синхронизировано")
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Ошибка синхронизации: {e}")
         return False
 
-    def _request(self, method="GET", endpoint="", params=None):
+    def _request(self, endpoint: str, params: dict = None) -> dict:
         timestamp = int(time.time() * 1000) + self.time_offset
-        recv_window = 10000
-
         if params is None:
             params = {}
-
-        if endpoint == "/v5/account/wallet-balance" and "accountType" not in params:
+        
+        if endpoint == "/v5/account/wallet-balance":
             params["accountType"] = "UNIFIED"
-
-        sign_params = {
-            "api_key": self.api_key,
-            "timestamp": timestamp,
-            "recv_window": recv_window
-        }
-        sign_params.update(params)
-
-        sorted_keys = sorted(sign_params.keys())
-        param_pairs = []
-
-        for key in sorted_keys:
-            value = sign_params[key]
-            if isinstance(value, bool):
-                value = "true" if value else "false"
-            else:
-                value = str(value)
-            param_pairs.append(f"{key}={value}")
-
-        param_str = '&'.join(param_pairs)
+        
+        params["api_key"] = self.api_key
+        params["timestamp"] = timestamp
+        params["recv_window"] = 10000
+        
+        sorted_keys = sorted(params.keys())
+        param_str = '&'.join([f"{k}={params[k]}" for k in sorted_keys])
         signature = hmac.new(
-            bytes(self.api_secret, 'utf-8'),
-            bytes(param_str, 'utf-8'),
+            self.api_secret.encode(),
+            param_str.encode(),
             hashlib.sha256
         ).hexdigest()
-
-        if method.upper() == "GET":
-            sign_params["sign"] = signature
-            url = f"{self.base_url}{endpoint}"
-            response = requests.get(url, params=sign_params, timeout=10)
-        else:
-            sign_params["sign"] = signature
-            url = f"{self.base_url}{endpoint}"
-            response = requests.post(url, json=sign_params, timeout=10)
-
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('retCode') == 10002:
-                self.sync_time()
-                return self._request(method, endpoint, params)
-            return result
-        else:
-            return {"retCode": response.status_code, "retMsg": response.text}
+        params["sign"] = signature
+        
+        url = f"{self.base_url}{endpoint}"
+        r = requests.get(url, params=params, timeout=10)
+        return r.json()
 
     def get_balance(self) -> float:
-        result = self._request(method="GET", endpoint="/v5/account/wallet-balance")
-
+        result = self._request("/v5/account/wallet-balance")
         if result.get('retCode') == 0:
-            try:
-                if 'result' in result and 'list' in result['result']:
-                    for coin in result['result']['list'][0]['coin']:
-                        if coin.get('coin') == 'USDT':
-                            return float(coin.get('walletBalance', 0))
-            except Exception:
-                pass
+            for coin in result['result']['list'][0]['coin']:
+                if coin['coin'] == 'USDT':
+                    return float(coin['walletBalance'])
         return 0
 
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
         result = self._request(
-            method="GET",
-            endpoint="/v5/market/kline",
-            params={"category": "linear", "symbol": symbol, "interval": "5", "limit": limit}
+            "/v5/market/kline",
+            {"category": "linear", "symbol": symbol, "interval": "5", "limit": limit}
         )
         data = []
         if result.get('retCode') == 0:
@@ -160,45 +149,33 @@ class BybitAPI:
         return []
 
     def get_current_price(self, symbol: str) -> float:
-        result = self._request(
-            method="GET",
-            endpoint="/v5/market/tickers",
-            params={"category": "linear", "symbol": symbol}
-        )
+        result = self._request("/v5/market/tickers", {"category": "linear", "symbol": symbol})
         if result.get('retCode') == 0:
             return float(result['result']['list'][0]['markPrice'])
         return 0
 
     def place_order(self, symbol: str, side: str, qty: float) -> bool:
         qty_str = str(int(qty)) if qty == int(qty) else f"{qty:.3f}"
-        result = self._request(
-            method="POST",
-            endpoint="/v5/order/create",
-            params={
-                "category": "linear",
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Market",
-                "qty": qty_str,
-                "timeInForce": "GTC",
-                "positionIdx": 0
-            }
-        )
+        result = self._request("/v5/order/create", {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": qty_str,
+            "timeInForce": "GTC",
+            "positionIdx": 0
+        })
         return result.get('retCode') == 0
 
     def set_stop_loss_take_profit(self, symbol: str, side: str,
                                    stop_loss: float, take_profit: float) -> bool:
-        result = self._request(
-            method="POST",
-            endpoint="/v5/position/trading-stop",
-            params={
-                "category": "linear",
-                "symbol": symbol,
-                "stopLoss": str(round(stop_loss, 2)),
-                "takeProfit": str(round(take_profit, 2)),
-                "positionIdx": 0
-            }
-        )
+        result = self._request("/v5/position/trading-stop", {
+            "category": "linear",
+            "symbol": symbol,
+            "stopLoss": str(round(stop_loss, 2)),
+            "takeProfit": str(round(take_profit, 2)),
+            "positionIdx": 0
+        })
         return result.get('retCode') == 0
 
 
@@ -260,10 +237,10 @@ class Analyzer:
 # ==================== ОСНОВНОЙ БОТ ====================
 
 class TradingBot:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False,
+    def __init__(self, api_key: str, api_secret: str,
                  telegram_token: str = None, telegram_chat_id: str = None):
 
-        self.api = BybitAPI(api_key, api_secret, testnet)
+        self.api = BybitAPI(api_key, api_secret)
         self.telegram = TelegramNotifier(telegram_token, telegram_chat_id)
         self.analyzer = Analyzer()
 
@@ -332,11 +309,8 @@ class TradingBot:
         self.api.set_stop_loss_take_profit(symbol, side, stop_loss, take_profit)
 
         self.positions[symbol] = {
-            'side': side,
-            'entry': price,
-            'qty': qty,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit
+            'side': side, 'entry': price, 'qty': qty,
+            'stop_loss': stop_loss, 'take_profit': take_profit
         }
         self.total_trades += 1
 
@@ -418,37 +392,18 @@ class TradingBot:
 # ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
-    API_KEY = os.getenv("API_KEY")
-    API_SECRET = os.getenv("API_SECRET")
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-    print("=" * 60)
-    print("🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ (ДЕМО-РЕЖИМ)")
-    print("=" * 60)
-
-    if not API_KEY or not API_SECRET:
-        print("❌ Ключи не найдены!")
-        exit(1)
-
-    test_api = BybitAPI(API_KEY, API_SECRET, testnet=False)
+    print("\n🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ...")
+    
+    test_api = BybitAPI(API_KEY, API_SECRET)
     balance = test_api.get_balance()
 
     if balance > 0:
         print(f"✅ УСПЕХ! Баланс: {balance:.2f} USDT")
-        bot = TradingBot(API_KEY, API_SECRET, testnet=False,
-                         telegram_token=TELEGRAM_TOKEN,
-                         telegram_chat_id=TELEGRAM_CHAT_ID)
+        bot = TradingBot(API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
         bot.run()
     else:
         print(f"❌ ОШИБКА! Баланс: {balance:.2f}")
-        print("\n👉 ИНСТРУКЦИЯ:")
-        print("1. Зайдите на bybit.com")
-        print("2. Включите демо-режим (Dual UI)")
-        print("3. Нажмите аватар → API Management")
-        print("4. Создайте НОВЫЙ API ключ с правами:")
-        print("   • Read-Write")
-        print("   • Derivatives Trading")
-        print("   • Unified Trading Account")
-        print("5. Обновите ключи в Railway Variables")
-        print("6. Нажмите Redeploy")
+        print("\n👉 ПРОВЕРЬТЕ:")
+        print("1. Включен ли демо-режим на bybit.com (Dual UI)")
+        print("2. Ключи созданы ПОСЛЕ включения демо-режима")
+        print("3. Включен ли Unified Trading Account")
