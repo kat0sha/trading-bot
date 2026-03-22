@@ -28,13 +28,20 @@ if not API_KEY or not API_SECRET:
     print("\n👉 ДОБАВЬТЕ В RAILWAY VARIABLES:")
     print("   API_KEY = ваш_ключ")
     print("   API_SECRET = ваш_секрет")
-    print("\nИ нажмите Redeploy")
     exit(1)
 
 print("=" * 60)
 
 # ==================== КОМИССИЯ ====================
 TAKER_FEE = 0.00055
+
+# ==================== USER-AGENT ДЛЯ ОБХОДА БЛОКИРОВОК ====================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "keep-alive"
+}
 
 
 # ==================== TELEGRAM ====================
@@ -53,9 +60,9 @@ class TelegramNotifier:
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
             data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
-            requests.post(url, json=data, timeout=10)
-        except Exception:
-            pass
+            requests.post(url, json=data, timeout=15, headers=HEADERS)
+        except Exception as e:
+            print(f"⚠️ Telegram ошибка: {e}")
 
     def send_trade(self, symbol: str, side: str, price: float, size: float,
                    strategy: str, reason: str):
@@ -82,16 +89,24 @@ class BybitAPI:
         self.api_secret = api_secret
         self.base_url = "https://api.bybit.com"
         self.time_offset = 0
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
         self._sync_time()
 
     def _sync_time(self):
         try:
-            r = requests.get(f"{self.base_url}/v5/market/time", timeout=5)
+            r = self.session.get(f"{self.base_url}/v5/market/time", timeout=10)
             if r.status_code == 200:
-                server_time = r.json()['result']['timeSecond']
-                self.time_offset = (int(server_time) * 1000) - int(time.time() * 1000)
-                print("✅ Время синхронизировано")
-                return True
+                data = r.json()
+                if data.get('retCode') == 0:
+                    server_time = data['result']['timeSecond']
+                    self.time_offset = (int(server_time) * 1000) - int(time.time() * 1000)
+                    print(f"✅ Время синхронизировано (смещение: {self.time_offset} мс)")
+                    return True
+                else:
+                    print(f"⚠️ Ошибка синхронизации: {data.get('retMsg')}")
+            else:
+                print(f"⚠️ HTTP {r.status_code} при синхронизации")
         except Exception as e:
             print(f"⚠️ Ошибка синхронизации: {e}")
         return False
@@ -118,15 +133,50 @@ class BybitAPI:
         params["sign"] = signature
         
         url = f"{self.base_url}{endpoint}"
-        r = requests.get(url, params=params, timeout=10)
-        return r.json()
+        
+        try:
+            r = self.session.get(url, params=params, timeout=15)
+            
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception as e:
+                    print(f"❌ Ошибка парсинга JSON: {e}")
+                    print(f"   Ответ: {r.text[:200]}")
+                    return {"retCode": -1, "retMsg": "JSON Parse Error"}
+            else:
+                print(f"❌ HTTP {r.status_code}: {r.text[:200]}")
+                return {"retCode": r.status_code, "retMsg": f"HTTP {r.status_code}"}
+                
+        except requests.exceptions.Timeout:
+            print("❌ Таймаут подключения к Bybit")
+            return {"retCode": -1, "retMsg": "Timeout"}
+        except requests.exceptions.ConnectionError:
+            print("❌ Ошибка соединения с Bybit")
+            return {"retCode": -1, "retMsg": "Connection Error"}
+        except Exception as e:
+            print(f"❌ Ошибка запроса: {e}")
+            return {"retCode": -1, "retMsg": str(e)}
 
     def get_balance(self) -> float:
+        print("🔍 Запрос баланса...")
         result = self._request("/v5/account/wallet-balance")
+        
+        print(f"📡 retCode: {result.get('retCode')}")
+        print(f"📡 retMsg: {result.get('retMsg')}")
+        
         if result.get('retCode') == 0:
-            for coin in result['result']['list'][0]['coin']:
-                if coin['coin'] == 'USDT':
-                    return float(coin['walletBalance'])
+            try:
+                for coin in result['result']['list'][0]['coin']:
+                    if coin['coin'] == 'USDT':
+                        balance = float(coin['walletBalance'])
+                        print(f"💰 Баланс: {balance:.2f} USDT")
+                        return balance
+            except Exception as e:
+                print(f"❌ Ошибка парсинга: {e}")
+        else:
+            print(f"❌ Ошибка API: {result.get('retMsg')}")
+        
         return 0
 
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
@@ -278,6 +328,7 @@ class TradingBot:
         df = pd.DataFrame(df_data)
         analysis = self.analyzer.analyze(df)
         if analysis['signal'] != 'neutral':
+            print(f"📊 {symbol}: {analysis['signal']} | Score: {analysis['score']} | RSI: {analysis['rsi']:.1f}")
             return analysis['signal'], analysis
         return None, None
 
@@ -392,18 +443,20 @@ class TradingBot:
 # ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
-    print("\n🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ...")
+    print("\n🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ К BYBIT...")
     
     test_api = BybitAPI(API_KEY, API_SECRET)
     balance = test_api.get_balance()
 
     if balance > 0:
-        print(f"✅ УСПЕХ! Баланс: {balance:.2f} USDT")
+        print(f"\n✅ УСПЕХ! Баланс: {balance:.2f} USDT")
+        print("\n🚀 ЗАПУСК БОТА...")
         bot = TradingBot(API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
         bot.run()
     else:
-        print(f"❌ ОШИБКА! Баланс: {balance:.2f}")
+        print(f"\n❌ ОШИБКА! Баланс: {balance:.2f}")
         print("\n👉 ПРОВЕРЬТЕ:")
         print("1. Включен ли демо-режим на bybit.com (Dual UI)")
         print("2. Ключи созданы ПОСЛЕ включения демо-режима")
         print("3. Включен ли Unified Trading Account")
+        print("4. Доступен ли API Bybit из вашей сети")
