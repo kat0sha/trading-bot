@@ -77,12 +77,10 @@ class TelegramNotifier:
 # ==================== API КЛИЕНТ ====================
 
 class BybitAPI:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = "https://api-demo.bybit.com" if testnet else "https://api.bybit.com"
-        self.time_offset = 0
-        self.sync_time()
+        self.base_url = "https://api.bybit.com" if not testnet else "https://api-demo.bybit.com"
 
     def sync_time(self):
         try:
