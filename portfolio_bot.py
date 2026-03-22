@@ -7,22 +7,6 @@ import pandas as pd
 import requests
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
-from dotenv import load_dotenv
-
-# ==================== ЗАГРУЗКА КЛЮЧЕЙ ====================
-load_dotenv("password.env")
-
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-print("=" * 60)
-print("🔑 ЗАГРУЗКА КЛЮЧЕЙ")
-print("=" * 60)
-print(f"API_KEY: {API_KEY[:10] if API_KEY else 'НЕ НАЙДЕН'}...")
-print(f"API_SECRET: {API_SECRET[:10] if API_SECRET else 'НЕ НАЙДЕН'}...")
-print("=" * 60)
 
 # ==================== КОМИССИЯ ====================
 TAKER_FEE = 0.00055
@@ -211,7 +195,6 @@ class BybitAPI:
         return 0
 
     def place_order(self, symbol: str, side: str, qty: float) -> bool:
-        """Размещение рыночного ордера"""
         qty_str = str(int(qty)) if qty == int(qty) else f"{qty:.3f}"
         result = self._request(
             method="POST",
@@ -230,10 +213,6 @@ class BybitAPI:
 
     def set_stop_loss_take_profit(self, symbol: str, side: str,
                                   stop_loss: float, take_profit: float) -> bool:
-        """
-        Установка стоп-лосса и тейк-профита через API Bybit
-        Это встроенные ордера биржи, срабатывают мгновенно даже если бот выключен
-        """
         result = self._request(
             method="POST",
             endpoint="/v5/position/trading-stop",
@@ -305,85 +284,242 @@ class Analyzer:
 
 # ==================== ОСНОВНОЙ БОТ ====================
 
-# ==================== ПАРАМЕТРЫ ДЛЯ МАЛОГО ДЕПОЗИТА (10 USDT) ====================
-
 class TradingBot:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True,
                  telegram_token: str = None, telegram_chat_id: str = None):
-        
+
         self.api = BybitAPI(api_key, api_secret, testnet)
         self.telegram = TelegramNotifier(telegram_token, telegram_chat_id)
         self.analyzer = Analyzer()
-        
-        # 👇 НАСТРОЙКИ ДЛЯ 10 USDT
-        self.symbols = ["XRPUSDT", "SOLUSDT", "BNBUSDT"]  # Только монеты с малым лотом
+
+        # Настройки
+        self.symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        self.position_size_percent = 20
+        self.stop_loss_percent = 2.0
+        self.take_profit_percent = 5.5
+        self.leverage = 10
+
         self.positions = {}
         self.running = False
         self.total_pnl = 0
         self.total_fees = 0
         self.total_trades = 0
         self.winning_trades = 0
-        
-        # Торговые параметры
-        self.position_size_percent = 50   # 50% от баланса (5 USDT на сделку)
-        self.stop_loss_percent = 3.0      # Стоп-лосс 3%
-        self.take_profit_percent = 6.0    # Тейк-профит 6%
-        self.leverage = 10                # Плечо 10x
-        
-        # Защита от слишком маленьких ордеров
-        self.min_position_value = 10      # Минимум 10 USDT с плечом
-        
+
         print("=" * 60)
-        print("🚀 ТОРГОВЫЙ БОТ (МАЛЫЙ ДЕПОЗИТ - 10 USDT)")
+        print("🚀 ТОРГОВЫЙ БОТ (SL/TP ЧЕРЕЗ API)")
         print(f"📊 Монеты: {self.symbols}")
         print(f"⚡ Плечо: {self.leverage}x")
         print(f"🎯 Риск: {self.position_size_percent}% от баланса")
         print(f"🛑 Стоп-лосс: {self.stop_loss_percent}%")
         print(f"🎯 Тейк-профит: {self.take_profit_percent}%")
         print("=" * 60)
-        
+
         if self.telegram.enabled:
             self.telegram.send_status(
-                f"🚀 Бот запущен (10 USDT режим)\n"
+                f"🚀 Бот запущен\n"
                 f"Монеты: {', '.join(self.symbols)}\n"
                 f"Плечо: {self.leverage}x\n"
                 f"SL: {self.stop_loss_percent}% | TP: {self.take_profit_percent}%"
             )
-    
+
+    def get_balance(self) -> float:
+        balance = self.api.get_balance()
+        print(f"💰 Баланс: {balance:.2f} USDT")
+        return balance
+
     def calculate_position_size(self, balance: float, price: float) -> float:
-        """Расчет размера позиции с проверкой минимального размера"""
         position_value = balance * (self.position_size_percent / 100)
-        
-        # Проверяем минимальную позицию
-        if position_value * self.leverage < self.min_position_value:
-            print(f"⚠️ Позиция слишком мала: {position_value * self.leverage:.2f} USDT < {self.min_position_value}")
-            return 0
-        
         qty = (position_value * self.leverage) / price
-        
-        # Округляем в зависимости от монеты
-        if 'XRP' in symbol:
-            qty = round(qty, 1)  # XRP можно 0.1
-        elif 'SOL' in symbol:
-            qty = round(qty, 2)  # SOL с 2 знаками
-        else:
-            qty = round(qty, 3)
-        
+        qty = round(qty, 6)
         return max(qty, 0.001)
-    
-    # ... остальной код без изменений ...
+
+    def check_signal(self, symbol: str) -> Tuple[Optional[str], Optional[Dict]]:
+        df_data = self.api.get_klines(symbol, 100)
+        if not df_data:
+            return None, None
+
+        df = pd.DataFrame(df_data)
+        analysis = self.analyzer.analyze(df)
+
+        if analysis['signal'] != 'neutral':
+            print(f"📊 {symbol}: {analysis['signal']} | Score: {analysis['score']} | RSI: {analysis['rsi']:.1f}")
+            return analysis['signal'], analysis
+        return None, None
+
+    def open_position(self, symbol: str, side: str, analysis: Dict):
+        balance = self.api.get_balance()
+        if balance < 10:
+            print("❌ Недостаточно средств")
+            return False
+
+        price = analysis['price']
+        qty = self.calculate_position_size(balance, price)
+
+        if qty <= 0:
+            print("❌ Размер позиции слишком мал")
+            return False
+
+        if side == "Buy":
+            stop_loss = round(price * (1 - self.stop_loss_percent / 100), 2)
+            take_profit = round(price * (1 + self.take_profit_percent / 100), 2)
+        else:
+            stop_loss = round(price * (1 + self.stop_loss_percent / 100), 2)
+            take_profit = round(price * (1 - self.take_profit_percent / 100), 2)
+
+        print(f"\n🚀 {symbol}: Открываем {side} позицию...")
+        print(f"   📊 Размер: {qty}")
+        print(f"   💰 Цена: {price:.2f}")
+        print(f"   🛑 SL: {stop_loss:.2f} ({self.stop_loss_percent}%)")
+        print(f"   🎯 TP: {take_profit:.2f} ({self.take_profit_percent}%)")
+
+        success = self.api.place_order(symbol, side, qty)
+
+        if not success:
+            print(f"❌ Не удалось открыть позицию")
+            return False
+
+        time.sleep(1)
+
+        sl_success = self.api.set_stop_loss_take_profit(symbol, side, stop_loss, take_profit)
+
+        if sl_success:
+            print(f"✅ SL/TP установлены")
+        else:
+            print(f"⚠️ Не удалось установить SL/TP")
+
+        self.positions[symbol] = {
+            'side': side,
+            'entry': price,
+            'qty': qty,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'score': analysis['score']
+        }
+
+        self.total_trades += 1
+
+        if self.telegram.enabled:
+            self.telegram.send_trade(
+                symbol, side, price, qty, 'hybrid',
+                f"Score: {analysis['score']}, SL: {stop_loss}, TP: {take_profit}"
+            )
+
+        return True
+
+    def close_position(self, symbol: str, price: float, reason: str):
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+
+        if pos['side'] == "Buy":
+            pnl = pos['qty'] * (price - pos['entry'])
+        else:
+            pnl = pos['qty'] * (pos['entry'] - price)
+
+        close_value = pos['qty'] * price
+        fee = close_value * TAKER_FEE
+        self.total_fees += fee
+
+        pnl_after_fees = pnl - fee
+        pnl_percent = (pnl_after_fees / (pos['entry'] * pos['qty'] / self.leverage)) * 100
+
+        self.total_pnl += pnl_after_fees
+        if pnl_after_fees > 0:
+            self.winning_trades += 1
+
+        print(f"\n🔒 {symbol} ЗАКРЫТА | {reason}")
+        print(f"   P&L: {pnl_after_fees:+.2f} USDT ({pnl_percent:+.2f}%)")
+
+        if self.telegram.enabled:
+            self.telegram.send_close(
+                symbol, pos['side'], pos['entry'], price,
+                pnl_after_fees, pnl_percent, 'hybrid', reason
+            )
+
+        del self.positions[symbol]
+
+    def check_positions(self):
+        for symbol in list(self.positions.keys()):
+            current_price = self.api.get_current_price(symbol)
+            if current_price <= 0:
+                continue
+
+            pos = self.positions[symbol]
+
+            if pos['side'] == "Buy":
+                if current_price <= pos['stop_loss']:
+                    self.close_position(symbol, current_price, "Stop Loss")
+                elif current_price >= pos['take_profit']:
+                    self.close_position(symbol, current_price, "Take Profit")
+            else:
+                if current_price >= pos['stop_loss']:
+                    self.close_position(symbol, current_price, "Stop Loss")
+                elif current_price <= pos['take_profit']:
+                    self.close_position(symbol, current_price, "Take Profit")
+
+    def run(self, interval: int = 30):
+        """Основной цикл бота - ЗДЕСЬ БЫЛО ПРОПУЩЕНО!"""
+        self.running = True
+        print("\n🚀 Бот запущен, начинаем торговлю...\n")
+
+        try:
+            while self.running:
+                balance = self.get_balance()
+                self.check_positions()
+
+                for symbol in self.symbols:
+                    if symbol in self.positions:
+                        continue
+
+                    signal, analysis = self.check_signal(symbol)
+                    if signal and analysis:
+                        self.open_position(symbol, signal, analysis)
+
+                time.sleep(interval)
+
+        except KeyboardInterrupt:
+            print("\n🛑 Остановка бота...")
+            self.running = False
+
+            for symbol in list(self.positions.keys()):
+                price = self.api.get_current_price(symbol)
+                self.close_position(symbol, price, "Бот остановлен")
+
+            print("\n" + "=" * 60)
+            print("📊 ИТОГОВАЯ СТАТИСТИКА")
+            print("=" * 60)
+            print(f"💰 Общий P&L: {self.total_pnl:.2f} USDT")
+            print(f"💸 Комиссий: {self.total_fees:.2f} USDT")
+            print(f"🎯 Всего сделок: {self.total_trades}")
+            print(f"🏆 Прибыльных: {self.winning_trades}")
+            if self.total_trades > 0:
+                print(f"📈 Win Rate: {self.winning_trades / self.total_trades * 100:.1f}%")
+            print("=" * 60)
 
 
 # ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
-    if not API_KEY or not API_SECRET:
-        print("\n❌ ОШИБКА: API ключи не найдены!")
-        print("Проверьте файл password.env")
-        print("Должно быть:\nAPI_KEY=ваш_ключ\nAPI_SECRET=ваш_секрет")
-        exit(1)
+    API_KEY = os.getenv("API_KEY", "YOUR_API_KEY")
+    API_SECRET = os.getenv("API_SECRET", "YOUR_API_SECRET")
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    print("\n🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ...")
+    print("=" * 60)
+    print("🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ")
+    print("=" * 60)
+
+    if API_KEY == "YOUR_API_KEY":
+        print("⚠️ ВНИМАНИЕ: Используются тестовые ключи!")
+        print("Добавьте в Railway Variables:")
+        print("  API_KEY = ваш_ключ")
+        print("  API_SECRET = ваш_секрет")
+        print("\nДля демо-режима Bybit:")
+        print("1. Включите демо-режим на bybit.com")
+        print("2. Создайте API ключи в демо-режиме")
+        print("3. Добавьте их в Variables")
+
     test_api = BybitAPI(API_KEY, API_SECRET, testnet=True)
     test_balance = test_api.get_balance()
 
